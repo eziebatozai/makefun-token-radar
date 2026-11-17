@@ -34,6 +34,9 @@ export interface ModelConstants {
   age_range: number;
   unknown_age_adj: number;
   max_board_rows: number;
+  position_tvl_share: number;
+  position_floor_usd: number;
+  position_cap_usd: number;
 }
 
 export const MODEL: ModelConstants = {
@@ -48,9 +51,12 @@ export const MODEL: ModelConstants = {
   age_range: 0.3,
   unknown_age_adj: 0.85,
   max_board_rows: 260,
+  position_tvl_share: 0.0002,
+  position_floor_usd: 100,
+  position_cap_usd: 2500,
 };
 
-export const MODEL_VERSION = 'snapshot-peer-median-1';
+export const MODEL_VERSION = 'walk-forward-cell-median-2';
 
 export interface BoardRow {
   rank: number;
@@ -70,6 +76,11 @@ export interface BoardRow {
   multiple: number;
   peer_median: number;
   peer_samples: number;
+  size_bucket: string;
+  fitted_multiple: number;
+  feature_growth_band: 'falling' | 'flat' | 'rising';
+  cell_samples: number;
+  suggested_position_usd: number;
   peer_source: 'category' | 'all-market';
   growth_adj: number;
   age_adj: number;
@@ -82,6 +93,42 @@ export interface PeerRow {
   median_multiple: number;
   used_global_fallback: boolean;
   category_observed_median: number | null;
+}
+
+export interface ValidationMetrics {
+  median_absolute_log_error: number;
+  within_factor_two_share: number;
+}
+
+export interface SizeBucketValidation {
+  label: string;
+  log10_tvl_min: number | null;
+  log10_tvl_max: number | null;
+  fit_rows: number;
+  holdout_rows: number;
+  median_realised_multiple: number | null;
+  median_fitted_multiple: number | null;
+}
+
+export interface ModelValidation {
+  split_field: 'listed_at';
+  split_date: string;
+  fit_rows: number;
+  holdout_rows: number;
+  overall_fit_multiple: number;
+  model: ValidationMetrics;
+  naive: ValidationMetrics;
+  verdict: 'beats' | 'trails';
+  size_buckets: SizeBucketValidation[];
+  method: {
+    size_feature: 'log10(tvl_usd)';
+    size_bucket_count: number;
+    growth_bands: string[];
+    flat_band_pct: number;
+    minimum_cell_rows: number;
+    cell_shrink_formula: string;
+    category_shrink_formula: string;
+  };
 }
 
 export interface TradingRow {
@@ -110,6 +157,7 @@ export interface RadarData {
     board_rows: number;
   };
   peer_table: PeerRow[];
+  validation: ModelValidation;
   top_5: Array<Pick<RadarRow, 'rank' | 'slug' | 'name' | 'category' | 'tvl_usd' | 'multiple' | 'implied_value_usd'>>;
   rows: RadarRow[];
   trading: TradingRow[];
@@ -178,31 +226,151 @@ function compareChains(a: string[], b: string[]): number {
   return compareText(a.join('\u0000'), b.join('\u0000'));
 }
 
-function peerTable(snapshot: Snapshot, constants: ModelConstants): { rows: PeerRow[]; globalMedian: number } {
-  const tokenProtocols = snapshot.protocols.filter(recordsTradingToken);
-  const multiplesByCategory = new Map<string, number[]>();
-  const allMultiples = tokenProtocols.map((p) => Math.min(constants.peer_multiple_max, Math.max(constants.peer_multiple_min, p.mcap_usd / p.tvl_usd)));
-  for (const p of tokenProtocols) {
-    const key = categoryKey(p.category);
-    const values = multiplesByCategory.get(key) ?? [];
-    values.push(Math.min(constants.peer_multiple_max, Math.max(constants.peer_multiple_min, p.mcap_usd / p.tvl_usd)));
-    multiplesByCategory.set(key, values);
+export interface FittedValueModel {
+  peerRows: PeerRow[];
+  validation: ModelValidation;
+  predict: (protocol: SnapshotProtocol) => { multiple: number; sizeBucket: string; growthBand: 'falling' | 'flat' | 'rising'; cellSamples: number; categoryMedian: number; categorySamples: number };
+}
+
+/** Split token observations by listing date, validate the snapshot-feature predictor, then refit it on all token observations. */
+export function fitAndValidateValueModel(snapshot: Snapshot, constants: ModelConstants = MODEL): FittedValueModel {
+  const SIZE_BUCKET_COUNT = 4;
+  const MIN_CELL_ROWS = 6;
+  const FLAT_CHANGE_THRESHOLD_PCT = 1;
+  const SHRINKAGE_PRIOR_ROWS = 6;
+  const LOG_ERROR_BASE = Math.E;
+  const allTokenRows = snapshot.protocols.filter(recordsTradingToken);
+  const tokenRows = allTokenRows.filter((p): p is SnapshotProtocol & { mcap_usd: number; listed_at: string } =>
+    p.listed_at !== null && Number.isFinite(Date.parse(p.listed_at)),
+  ).sort((a, b) => compareText(a.listed_at, b.listed_at) || compareText(a.slug, b.slug));
+  if (tokenRows.length < 4) throw new SnapshotError('walk-forward validation needs at least four listed token observations');
+  const splitIndex = Math.floor(tokenRows.length / 2);
+  const fitRows = tokenRows.slice(0, splitIndex);
+  const holdoutRows = tokenRows.slice(splitIndex);
+  const splitDate = tokenRows[splitIndex]!.listed_at;
+  const growthBand = (change: number | null): 'falling' | 'flat' | 'rising' =>
+    change !== null && change < -FLAT_CHANGE_THRESHOLD_PCT ? 'falling'
+      : change !== null && change > FLAT_CHANGE_THRESHOLD_PCT ? 'rising' : 'flat';
+  const logSize = (p: SnapshotProtocol): number => Math.log10(Math.max(p.tvl_usd, 1));
+  const quantile = (values: number[], fraction: number): number => {
+    const sorted = [...values].sort((a, b) => a - b);
+    const position = (sorted.length - 1) * fraction;
+    const lower = Math.floor(position);
+    return sorted[lower]! + (sorted[Math.ceil(position)]! - sorted[lower]!) * (position - lower);
+  };
+  const bucketName = (index: number, edges: number[]): string =>
+    `Size ${index + 1} · log10(TVL) ${edges[index]!.toFixed(2)}–${edges[index + 1]!.toFixed(2)}`;
+  const fit = (training: Array<SnapshotProtocol & { mcap_usd: number }>) => {
+    const logs = training.map(logSize);
+    const minLog = Math.min(...logs);
+    const maxLog = Math.max(...logs);
+    const edges = Array.from({ length: SIZE_BUCKET_COUNT + 1 }, (_, i) => minLog + (maxLog - minLog) * i / SIZE_BUCKET_COUNT);
+    const sizeIndex = (p: SnapshotProtocol): number => Math.min(SIZE_BUCKET_COUNT - 1,
+      Math.max(0, Math.floor((logSize(p) - minLog) / ((maxLog - minLog) || 1) * SIZE_BUCKET_COUNT)));
+    const overallMedian = median(training.map((p) => p.mcap_usd / p.tvl_usd));
+    const byCategory = new Map<string, typeof training>();
+    for (const p of training) byCategory.set(categoryKey(p.category), [...(byCategory.get(categoryKey(p.category)) ?? []), p]);
+    const categoryValues = new Map<string, { median: number; samples: number }>();
+    for (const [category, members] of byCategory) {
+      const observedMedian = median(members.map((p) => p.mcap_usd / p.tvl_usd));
+      const categoryWeight = members.length / (members.length + SHRINKAGE_PRIOR_ROWS);
+      categoryValues.set(category, { median: observedMedian * categoryWeight + overallMedian * (1 - categoryWeight), samples: members.length });
+    }
+    const cells = new Map<string, typeof training>();
+    const cellKey = (p: SnapshotProtocol): string => `${sizeIndex(p)}|${categoryKey(p.category)}|${growthBand(p.change_7d)}`;
+    for (const p of training) cells.set(cellKey(p), [...(cells.get(cellKey(p)) ?? []), p]);
+    const categoryPrior = (category: string): number => categoryValues.get(category)?.median ?? overallMedian;
+    const predict = (p: SnapshotProtocol) => {
+      const index = sizeIndex(p);
+      const members = cells.get(cellKey(p)) ?? [];
+      const category = categoryKey(p.category);
+      const prior = categoryPrior(category);
+      const cellMedian = members.length ? median(members.map((member) => member.mcap_usd / member.tvl_usd)) : prior;
+      const cellWeight = members.length >= MIN_CELL_ROWS ? 1 : members.length / MIN_CELL_ROWS;
+      return {
+        multiple: cellMedian * cellWeight + prior * (1 - cellWeight),
+        sizeBucket: bucketName(index, edges),
+        growthBand: growthBand(p.change_7d),
+        cellSamples: members.length,
+        categoryMedian: prior,
+        categorySamples: categoryValues.get(category)?.samples ?? 0,
+      };
+    };
+    return { edges, sizeIndex, overallMedian, categoryValues, predict };
+  };
+  const validationFit = fit(fitRows);
+  const validationPredict = (p: SnapshotProtocol): number => validationFit.predict(p).multiple;
+  const summarizeErrors = (evaluate: (p: typeof holdoutRows[number]) => number): ValidationMetrics => {
+    const logErrors = holdoutRows.map((p) => Math.abs(Math.log(evaluate(p) / (p.mcap_usd / p.tvl_usd)) / Math.log(LOG_ERROR_BASE)));
+    return {
+      median_absolute_log_error: roundTo(median(logErrors)),
+      within_factor_two_share: roundTo(holdoutRows.filter((p) => {
+        const ratio = evaluate(p) / (p.mcap_usd / p.tvl_usd);
+        return ratio >= 0.5 && ratio <= 2;
+      }).length / holdoutRows.length, 6),
+    };
+  };
+  const modelMetrics = summarizeErrors(validationPredict);
+  const naiveMetrics = summarizeErrors(() => validationFit.overallMedian);
+  const holdoutBucketStats = new Map<number, { realized: number[]; predicted: number[] }>();
+  for (const p of holdoutRows) {
+    const bucket = validationFit.sizeIndex(p);
+    const stats = holdoutBucketStats.get(bucket) ?? { realized: [], predicted: [] };
+    stats.realized.push(p.mcap_usd / p.tvl_usd);
+    stats.predicted.push(validationPredict(p));
+    holdoutBucketStats.set(bucket, stats);
   }
-  const globalMedian = median(allMultiples);
+  const sizeBuckets: SizeBucketValidation[] = Array.from({ length: SIZE_BUCKET_COUNT }, (_, index) => {
+    const stats = holdoutBucketStats.get(index);
+    const fitCount = fitRows.filter((p) => validationFit.sizeIndex(p) === index).length;
+    return {
+      label: bucketName(index, validationFit.edges),
+      log10_tvl_min: roundTo(validationFit.edges[index]!),
+      log10_tvl_max: roundTo(validationFit.edges[index + 1]!),
+      fit_rows: fitCount,
+      holdout_rows: stats?.realized.length ?? 0,
+      median_realised_multiple: stats ? roundTo(median(stats.realized)) : null,
+      median_fitted_multiple: stats ? roundTo(median(stats.predicted)) : null,
+    };
+  });
+  const fullFit = fit(allTokenRows);
   const categories = new Set(snapshot.protocols.map((p) => categoryKey(p.category)));
-  const rows = [...categories].sort(compareText).map((category) => {
-    const observed = multiplesByCategory.get(category) ?? [];
-    const observedMedian = observed.length > 0 ? median(observed) : null;
-    const fallback = observed.length < constants.category_peer_min_samples;
+  const peerRows = [...categories].sort(compareText).map((category) => {
+    const observed = tokenRows.filter((p) => categoryKey(p.category) === category).map((p) => p.mcap_usd / p.tvl_usd);
+    const observedMedian = observed.length ? median(observed) : null;
+    const categorySamples = fullFit.categoryValues.get(category)?.samples ?? 0;
     return {
       category,
-      sample_count: observed.length,
-      median_multiple: roundTo(fallback ? globalMedian : observedMedian!),
-      used_global_fallback: fallback,
+      sample_count: categorySamples,
+      median_multiple: roundTo(fullFit.categoryValues.get(category)?.median ?? fullFit.overallMedian),
+      used_global_fallback: categorySamples === 0,
       category_observed_median: observedMedian === null ? null : roundTo(observedMedian),
     };
   });
-  return { rows, globalMedian };
+  return {
+    peerRows,
+    validation: {
+      split_field: 'listed_at',
+      split_date: splitDate,
+      fit_rows: fitRows.length,
+      holdout_rows: holdoutRows.length,
+      overall_fit_multiple: roundTo(validationFit.overallMedian),
+      model: modelMetrics,
+      naive: naiveMetrics,
+      verdict: modelMetrics.median_absolute_log_error <= naiveMetrics.median_absolute_log_error ? 'beats' : 'trails',
+      size_buckets: sizeBuckets,
+      method: {
+        size_feature: 'log10(tvl_usd)',
+        size_bucket_count: SIZE_BUCKET_COUNT,
+        growth_bands: ['falling', 'flat', 'rising'],
+        flat_band_pct: FLAT_CHANGE_THRESHOLD_PCT,
+        minimum_cell_rows: MIN_CELL_ROWS,
+        cell_shrink_formula: 'cell weight = min(1, cell rows / 6); remainder goes to category prior',
+        category_shrink_formula: 'category weight = category fit rows / (category fit rows + 6); remainder goes to fit-set overall median',
+      },
+    },
+    predict: fullFit.predict,
+  };
 }
 
 function formatUsd(n: number): string {
@@ -221,11 +389,10 @@ function chainOf(p: SnapshotProtocol): string {
   return p.chains[0] || 'the protocol app’s listed chain';
 }
 
-function capitalFor(p: SnapshotProtocol): number {
-  if (p.tvl_usd >= 5_000_000_000) return 250;
-  if (p.tvl_usd >= 1_000_000_000) return 200;
-  if (p.tvl_usd >= 100_000_000) return 100;
-  return 50;
+function capitalFor(p: SnapshotProtocol, constants: ModelConstants): number {
+  const rawPosition = p.tvl_usd * constants.position_tvl_share;
+  const readablePosition = Math.round(rawPosition / 50) * 50;
+  return Math.min(constants.position_cap_usd, Math.max(constants.position_floor_usd, readablePosition));
 }
 
 function gasBudget(chain: string, transactions = 1): string {
@@ -362,22 +529,25 @@ function categoryActions(category: string | null): PlanActions {
   };
 }
 
-function farmSteps(p: SnapshotProtocol, age: number | null): string[] {
+function farmSteps(p: SnapshotProtocol, age: number | null, constants: ModelConstants): string[] {
   const chain = chainOf(p);
-  const capital = capitalFor(p);
+  const capital = capitalFor(p, constants);
+  const position = `$${capital.toLocaleString('en-US')}`;
   const holdDays = age === null ? 30 : age < 180 ? 60 : age < 365 ? 45 : 30;
-  const context = `${p.name} reports ${formatUsd(p.tvl_usd)} TVL on ${chain}; ${formatChange(p.change_7d)}.`;
+  const chainContext = p.chains.length > 2 ? `${p.chains.slice(0, 2).join(', ')} +${p.chains.length - 2} chains` : p.chains.join(', ') || chain;
+  const context = `${p.name}: ${formatUsd(p.tvl_usd)} TVL; ${chainContext}; ${formatChange(p.change_7d)}.`;
+  const concise = (text: string, limit: number): string => text.length <= limit ? text : `${text.slice(0, limit - 1).replace(/\s+\S*$/, '')}…`;
   const actions = categoryActions(p.category);
   const setupCost = gasBudget(chain);
   const openCost = gasBudget(chain, 2);
   const exitCost = gasBudget(chain, 2);
   return [
-    `${context} Confirm the official app and contract, check supported assets and revoke unrelated approvals; use a separate wallet if practical. Cost: ${setupCost}. Time: 10 minutes.`,
-    `Set a $${capital} maximum budget, then ${actions.open.charAt(0).toLowerCase()}${actions.open.slice(1)} Cost: $${capital} position capital plus ${openCost}. Time: 15 minutes.`,
-    `For measurable activity, ${actions.activity.charAt(0).toLowerCase()}${actions.activity.slice(1)} Cost: $5 activity budget plus ${gasBudget(chain)}; confirm any fee before signing. Time: 10 minutes, once this week.`,
-    `Keep the position open for ${holdDays} days only while its risks and exit route remain acceptable; check balances and protocol notices weekly. Cost: $${capital} remains exposed; budget $2 for checks/gas. Time: ${holdDays} days.`,
-    `Exit by withdrawing or closing through the official app, verify the funds arrive, then revoke approvals you no longer need. Cost: ${exitCost} plus any displayed withdrawal fee. Time: 10–20 minutes.`,
-  ];
+    `${context} Suggested single-position size ${position}: 0.02% of TVL, rounded to $50, floored at $100 and capped at $2,500; use this limit, not a generic deposit. Cost: ${position} reserved capital plus ${setupCost}. Time: 10 minutes.`,
+    `On ${chain}, ${concise(actions.open.charAt(0).toLowerCase() + actions.open.slice(1), 125)} Keep ${p.name} exposure within the same ${position} cap. Cost: ${position} capital plus ${openCost}. Time: 15 minutes.`,
+    `${p.name} ${formatUsd(p.tvl_usd)} TVL · ${formatChange(p.change_7d)}: ${concise(actions.activity.charAt(0).toLowerCase() + actions.activity.slice(1), 115)}; use the same ${position} exposure cap. Cost: reuse ${position} plus ${gasBudget(chain)}. Time: 10 minutes this week.`,
+    `Hold at most ${position} in ${p.name} for ${holdDays} days; snapshot ${formatUsd(p.tvl_usd)} TVL, ${chainContext}, ${formatChange(p.change_7d)}. Review the position and exit route weekly. Cost: ${position} exposed; checks ${gasBudget(chain)}. Time: ${holdDays} days.`,
+    `Exit ${p.name} through its official app, withdraw the same ${position} cap, verify receipt, then revoke unused approvals; allow for the withdrawal queue. Cost: release ${position}; exit ${exitCost} plus any displayed withdrawal fee. Time: 10–20 minutes.`,
+  ].map((step) => step.length <= 500 ? step : `${concise(step.slice(0, step.indexOf(' Cost:')), 190)} ${step.slice(step.indexOf('Cost:'))}`);
 }
 
 interface ScoredProtocol {
@@ -388,8 +558,13 @@ interface ScoredProtocol {
   peerMedian: number;
   peerSamples: number;
   peerSource: 'category' | 'all-market';
+  sizeBucket: string;
+  fittedMultiple: number;
+  growthBand: 'falling' | 'flat' | 'rising';
+  cellSamples: number;
   multiple: number;
   implied: number;
+  suggestedPosition: number;
 }
 
 function buildTrading(snapshot: Snapshot): TradingRow[] {
@@ -406,7 +581,7 @@ function buildTrading(snapshot: Snapshot): TradingRow[] {
     }));
 }
 
-function buildBoard(snapshot: Snapshot, peerRows: PeerRow[], constants: ModelConstants): BoardRow[] {
+function buildBoard(snapshot: Snapshot, fitted: FittedValueModel, constants: ModelConstants): BoardRow[] {
   const bySlug = new Map(snapshot.protocols.map((p) => [p.slug, p]));
   const chosen = new Map<string, SnapshotProtocol>();
   for (const slug of snapshot.watchlist) {
@@ -420,12 +595,11 @@ function buildBoard(snapshot: Snapshot, peerRows: PeerRow[], constants: ModelCon
     .slice(0, room);
   for (const p of early) chosen.set(p.slug, p);
 
-  const peerByCategory = new Map(peerRows.map((row) => [row.category, row]));
   const scored: ScoredProtocol[] = [...chosen.values()].map((p) => {
-    const peer = peerByCategory.get(categoryKey(p.category));
-    const peerMedian = peer?.median_multiple ?? 1;
-    const peerSamples = peer?.sample_count ?? 0;
-    const peerSource = peer?.used_global_fallback ? 'all-market' : 'category';
+    const prediction = fitted.predict(p);
+    const peerMedian = prediction.categoryMedian;
+    const peerSamples = prediction.categorySamples;
+    const peerSource = prediction.categorySamples > 0 ? 'category' : 'all-market';
     const rawChange = p.change_7d ?? 0;
     const clampedChange = Math.min(constants.growth_cap_pct, Math.max(constants.growth_floor_pct, rawChange));
     const growthAdj = 1 + (clampedChange / 100) * constants.growth_weight;
@@ -433,9 +607,14 @@ function buildBoard(snapshot: Snapshot, peerRows: PeerRow[], constants: ModelCon
     const ageAdj = age === null
       ? constants.unknown_age_adj
       : constants.age_base + constants.age_range * Math.min(age, constants.age_days_cap) / constants.age_days_cap;
-    const multiple = peerMedian * growthAdj * ageAdj;
+    const multiple = prediction.multiple * growthAdj * ageAdj;
     const implied = Math.max(1, Math.round(p.tvl_usd * multiple));
-    return { protocol: p, age, growthAdj, ageAdj, peerMedian, peerSamples, peerSource, multiple, implied };
+    return {
+      protocol: p, age, growthAdj, ageAdj, peerMedian, peerSamples, peerSource, multiple, implied,
+      sizeBucket: prediction.sizeBucket, fittedMultiple: prediction.multiple,
+      growthBand: prediction.growthBand, cellSamples: prediction.cellSamples,
+      suggestedPosition: capitalFor(p, constants),
+    };
   });
   scored.sort((a, b) => b.implied - a.implied || b.protocol.tvl_usd - a.protocol.tvl_usd || compareChains(a.protocol.chains, b.protocol.chains) || compareText(a.protocol.slug, b.protocol.slug));
 
@@ -461,20 +640,26 @@ function buildBoard(snapshot: Snapshot, peerRows: PeerRow[], constants: ModelCon
       age_days: s.age,
       implied_value_usd: implied,
       multiple: roundTo(s.multiple),
-      peer_median: s.peerMedian,
+      peer_median: roundTo(s.peerMedian),
       peer_samples: s.peerSamples,
+      size_bucket: s.sizeBucket,
+      fitted_multiple: roundTo(s.fittedMultiple),
+      feature_growth_band: s.growthBand,
+      cell_samples: s.cellSamples,
+      suggested_position_usd: s.suggestedPosition,
       peer_source: s.peerSource,
       growth_adj: roundTo(s.growthAdj),
       age_adj: roundTo(s.ageAdj),
-      farm_steps: farmSteps(p, s.age),
+      farm_steps: farmSteps(p, s.age, constants),
     };
   });
 }
 
 /** Build the complete ranked board plus snapshot-derived peer anchors and separate market observations. */
 export function buildRadar(snapshot: Snapshot, constants: ModelConstants = MODEL): { board: BoardRow[]; radar: RadarData } {
-  const { rows: peerRows } = peerTable(snapshot, constants);
-  const board = buildBoard(snapshot, peerRows, constants);
+  const fitted = fitAndValidateValueModel(snapshot, constants);
+  const peerRows = fitted.peerRows;
+  const board = buildBoard(snapshot, fitted, constants);
   const trading = buildTrading(snapshot);
   const preTokenCount = snapshot.protocols.filter(isPreToken).length;
   const earlySize = board.filter((row) => !snapshot.watchlist.includes(row.slug)).length;
@@ -492,6 +677,7 @@ export function buildRadar(snapshot: Snapshot, constants: ModelConstants = MODEL
       board_rows: board.length,
     },
     peer_table: peerRows,
+    validation: fitted.validation,
     top_5: board.slice(0, 5).map(({ rank, slug, name, category, tvl_usd, multiple, implied_value_usd }) => ({ rank, slug, name, category, tvl_usd, multiple, implied_value_usd })),
     rows: board,
     trading,

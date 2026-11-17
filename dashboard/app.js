@@ -275,11 +275,13 @@
     var formula = node('div','formula');
     var factorRows = [
       ['TVL',usd(r.tvl_usd)],
-      ['Category peer median',Number(r.peer_median).toFixed(4) + '× (' + (r.peer_source === 'category' ? 'category median' : 'all-market median') + ', ' + (r.peer_source === 'category' ? r.peer_samples : D.counts.trading) + ' protocol' + ((r.peer_source === 'category' ? r.peer_samples : D.counts.trading) === 1 ? '' : 's') + ')'],
+      ['Snapshot size bucket',r.size_bucket + ' · ' + r.feature_growth_band + ' growth · ' + r.cell_samples + ' fit cell rows'],
+      ['Fitted mcap/TVL multiple',Number(r.fitted_multiple).toFixed(4) + '× (' + (r.peer_source === 'category' ? 'shrunk category/cell predictor' : 'overall-fit fallback') + ')'],
       ['7-day growth adjustment',Number(r.growth_adj).toFixed(4) + '× from ' + percent(r.change_7d)],
       ['Age adjustment',Number(r.age_adj).toFixed(4) + '× from ' + age(r.age_days)],
-      ['Factor product',Number(r.peer_median).toFixed(4) + ' × ' + Number(r.growth_adj).toFixed(4) + ' × ' + Number(r.age_adj).toFixed(4) + ' = ' + Number(r.multiple).toFixed(6) + '×'],
+      ['Factor product',Number(r.fitted_multiple).toFixed(4) + ' × ' + Number(r.growth_adj).toFixed(4) + ' × ' + Number(r.age_adj).toFixed(4) + ' = ' + Number(r.multiple).toFixed(6) + '×'],
       ['Combined multiple',Number(r.multiple).toFixed(6) + '×'],
+      ['Suggested position',usd(r.suggested_position_usd) + ' · 0.02% of TVL, $100 floor / $2,500 cap'],
       ['TVL × multiple',usd(r.tvl_usd) + ' × ' + Number(r.multiple).toFixed(6) + ' = ' + usd(r.implied_value_usd)]
     ];
     factorRows.forEach(function (x) { var row = node('div','formula-row'); append(row,node('span','formula-label',x[0]),node('strong','formula-val',x[1])); formula.appendChild(row); });
@@ -309,12 +311,13 @@
       var body = cost ? text.slice(0,cost.index).trim() : text;
       content.appendChild(node('p','step-text',body));li.appendChild(content);
       var costText=cost&&cost[1]?cost[1].replace(/[.;]$/,''):'Not stated';var timeText=cost&&cost[2]?cost[2].replace(/[.;]$/,''):'Not stated';
-      var amountMatches=costText.match(/\$\s*([\d,]+(?:\.\d+)?)/g)||[];amountMatches.forEach(function(x){var n=Number(x.replace(/[^\d.]/g,''));if(isFinite(n)){costTotal+=n;hasCost=true;}});
+      var amountMatches=costText.match(/\$\s*([\d,]+(?:\.\d+)?)/g)||[];amountMatches.forEach(function(x){var n=Number(x.replace(/[^\d.]/g,''));if(isFinite(n)){if(n!==Number(r.suggested_position_usd))costTotal+=n;hasCost=true;}});
       var duration=timeText.match(/(\d+(?:\.\d+)?)(?:\s*[–-]\s*(\d+(?:\.\d+)?))?\s*(minutes?|mins?|hours?|days?)/i);if(duration){var amount=(Number(duration[1])+(duration[2]?Number(duration[2]):0))/ (duration[2]?2:1);var unit=duration[3].toLowerCase();timeMinutes+=amount*(unit.indexOf('day')===0?1440:unit.indexOf('hour')===0?60:1);}
       var costCol=node('div','step-metric step-cost');append(costCol,node('span','','COST'),node('strong','',costText));var timeCol=node('div','step-metric step-time');append(timeCol,node('span','','TIME'),node('strong','',timeText));append(li,costCol,timeCol);ol.appendChild(li);
     });
+    if(hasCost)costTotal+=Number(r.suggested_position_usd);
     var totalDays=timeMinutes/1440,totalText=totalDays>=1?String(Math.round(totalDays*10)/10)+' days':Math.max(1,Math.round(timeMinutes/60))+' hours';
-    var planTotal=node('p','plan-total');append(planTotal,node('span','','Cost-chip total · capital at risk included'),node('strong','', 'About '+(hasCost?usd(costTotal):'cost not stated')+' and '+totalText));
+    var planTotal=node('p','plan-total');append(planTotal,node('span','','One position cap plus estimated transaction costs'),node('strong','', 'About '+(hasCost?usd(costTotal):'cost not stated')+' and '+totalText));
     stepsSection.appendChild(ol);stepsSection.appendChild(planTotal);wrap.appendChild(stepsSection);
     var peerTrading = trading.filter(function (t) { return t.category === r.category; }).slice(0,5);
     var market = node('section','section card'); var mh = node('div','section-head'); append(mh,node('h2','','Token-recording peers'),node('p','','Same category · market-reported data')); market.appendChild(mh);
@@ -357,15 +360,26 @@
     append(copy,node('div','kicker','Method / inspect the inputs'),node('h1','','The model, in the open.'),node('p','intro','A consistent scoring rule for every pre-token protocol. Peer multiples come from observed market cap divided by TVL; live token protocols remain separate from the ranked estimate.'));
     hero.appendChild(copy); wrap.appendChild(hero);
     var card = node('section','card'); card.appendChild(node('h2','','Formula'));
-    var formulaText = 'Implied value = round(TVL × category peer median × growth adjustment × age adjustment). The combined multiple is the product of the three adjustments and the category peer median.';
+    var formulaText = 'Implied value = round(TVL × fitted snapshot-feature multiple × growth adjustment × age adjustment). The predictor uses log10(TVL) size buckets, category and seven-day growth bands; already-trading tokens stay out of the pre-token board.';
     var c=D.constants;
-    formulaText += ' Growth adjustment = 1 + clamp(7-day change, ' + c.growth_floor_pct + '%, ' + c.growth_cap_pct + '%) / 100 × ' + c.growth_weight + '. Age adjustment = ' + c.age_base + ' + ' + c.age_range + ' × min(age days, ' + c.age_days_cap + ') / ' + c.age_days_cap + '; unknown age uses ' + c.unknown_age_adj + '.';
+    formulaText += ' Growth adjustment = 1 + clamp(7-day change, ' + c.growth_floor_pct + '%, ' + c.growth_cap_pct + '%) / 100 × ' + c.growth_weight + '. Age adjustment = ' + c.age_base + ' + ' + c.age_range + ' × min(age days, ' + c.age_days_cap + ') / ' + c.age_days_cap + '; unknown age uses ' + c.unknown_age_adj + '. Suggested position = 0.02% of snapshot TVL, rounded to $50, with a $100 floor and $2,500 cap.';
     card.appendChild(node('p','equation-note',formulaText));
     var constTitle = node('h2','','Model constants'); constTitle.style.marginTop = '20px'; card.appendChild(constTitle);
     var constants = node('div','figure-grid'); Object.keys(D.constants).sort().forEach(function (k) {
       var box = node('div','figure-box'); append(box,node('span','',k.replace(/_/g,' ')),node('b','figure',String(D.constants[k]))); constants.appendChild(box);
     }); card.appendChild(constants);
     wrap.appendChild(card);
+    var validation = D.validation;
+    var validationCard = node('section','card section validation-card');
+    validationCard.appendChild(node('h2','','Walk-forward validation'));
+    validationCard.appendChild(node('p','equation-note','Token protocols with listed_at split at the median date ' + validation.split_date + ': older half fits the predictor; newer half is untouched holdout. Predictor fit uses only log10(TVL), category median and falling / flat / rising 7-day change. Reported median absolute log errors use natural logarithms. A cell with fewer than ' + validation.method.minimum_cell_rows + ' observations is shrunk toward its category prior; category prior weight is n/(n+6), with the remainder toward the fit-set overall median.'));
+    var validationStats = node('div','figure-grid validation-stats');
+    [['Fit rows',validation.fit_rows],['Holdout rows',validation.holdout_rows],['Model median absolute log error',Number(validation.model.median_absolute_log_error).toFixed(4)],['Naive median absolute log error',Number(validation.naive.median_absolute_log_error).toFixed(4)],['Model inside factor 2',(validation.model.within_factor_two_share*100).toFixed(1)+'%'],['Naive inside factor 2',(validation.naive.within_factor_two_share*100).toFixed(1)+'%'],['Median error comparison',validation.verdict+' naive by '+Math.abs(validation.naive.median_absolute_log_error-validation.model.median_absolute_log_error).toFixed(4)+'; factor-two share '+(validation.model.within_factor_two_share>validation.naive.within_factor_two_share?'beats':'trails')]].forEach(function(x){var box=node('div','figure-box');append(box,node('span','',x[0]),node('b','figure',String(x[1])));validationStats.appendChild(box);});
+    validationCard.appendChild(validationStats);
+    var sizeTitle=node('h3','validation-subtitle','Holdout by four log10(TVL) size buckets');validationCard.appendChild(sizeTitle);
+    var sizeTable=node('table','validation-table'),sizeHead=node('thead'),sizeHeader=node('tr');['Size bucket','Fit rows','Holdout rows','Realised median','Fitted median'].forEach(function(x){sizeHeader.appendChild(node('th','',x));});sizeHead.appendChild(sizeHeader);sizeTable.appendChild(sizeHead);
+    var sizeBody=node('tbody');validation.size_buckets.forEach(function(b){var tr=node('tr');[b.label,String(b.fit_rows),String(b.holdout_rows),b.median_realised_multiple===null?'—':Number(b.median_realised_multiple).toFixed(4)+'×',b.median_fitted_multiple===null?'—':Number(b.median_fitted_multiple).toFixed(4)+'×'].forEach(function(x){tr.appendChild(boardCell('Size bucket',x,''));});sizeBody.appendChild(tr);});sizeTable.appendChild(sizeBody);validationCard.appendChild(sizeTable);
+    wrap.appendChild(validationCard);
     var counts = node('section','card section'); counts.appendChild(node('h2','','Snapshot and coverage'));
     var countGrid = node('div','figure-grid');
     [['As of',D.as_of],['TVL floor',usd(D.floor_usd)],['Protocols indexed',D.counts.protocols],['Watchlist',D.watchlist_size],['Pre-token protocols',D.counts.pre_token],['Rows scored',D.board_size],['Trading protocols',D.counts.trading],['Model version',D.model_version]].forEach(function (x) { var b=node('div','figure-box'); append(b,node('span','',x[0]),node('b','figure',String(x[1]))); countGrid.appendChild(b); });
