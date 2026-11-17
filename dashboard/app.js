@@ -5,7 +5,8 @@
   if (!D || !root) { root.textContent = 'Radar data is unavailable.'; return; }
   var rows = D.rows.slice();
   var trading = D.trading.slice().sort(function (a, b) { return b.mcap_usd - a.mcap_usd; });
-  var state = { q: '', category: 'all', chain: 'all', band: 'all', minimum: 'all', sort: 'rank', direction: 1, peerDirection: -1 };
+  var WATCHLIST = new Set(['armitage-by-wintermute','axis','b14g','bittensor-dtao','clearstar','curvance','doppler-finance','ember','firelight','galaxy-curation','gami-labs','gauntlet','hive-protocol','hyperithm','infinifi','k3-capital','keyrock','lagoon','lightning-network','lofty','mezo-earn','noble','nonce-capital','onre','opentrade','plume-vaults','r25','reti-pooling','rockawayx','saturn','steakhouse-financial','symbiotic','tori-finance','tulipa-capital','tydro','upshift','usdd','valos','veda','yuzu-money']);
+  var state = { q: '', category: 'all', chain: 'all', band: 'all', minimum: 'all', watchlistOnly: false, sort: 'rank', direction: 1, peerDirection: -1 };
   var boardRows = Object.create(null);
   var money = new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 0 });
   function usd(n) {
@@ -64,7 +65,7 @@
   }
   function footer(parent) {
     var f = node('footer', 'footer');
-    append(f, node('span', '', 'Method: TVL × category peer median × seven-day growth adjustment × age adjustment. Estimates are not market prices.'), node('span', '', 'One rule for every protocol; no protocol name is ever special-cased.'));
+    append(f, node('span', '', 'Method: TVL × peer median × seven-day growth × age. Estimates, not market prices.'), node('span', '', 'One model rule; no name-based estimates.'));
     parent.appendChild(f);
   }
   function stat(label, value, note) {
@@ -103,6 +104,7 @@
         if (r.tvl_usd < b[0] || (b[1] && r.tvl_usd >= b[1])) return false;
       }
       if (state.minimum !== 'all' && r.implied_value_usd < Number(state.minimum)) return false;
+      if (state.watchlistOnly && !WATCHLIST.has(r.slug)) return false;
       if (q && [r.name, r.slug, r.category, (r.chains || []).join(' ')].join(' ').toLowerCase().indexOf(q) < 0) return false;
       return true;
     }));
@@ -119,16 +121,51 @@
     });
     th.appendChild(b); return th;
   }
+  function drawInsights() {
+    var band=node('section','insights-band');
+    var sorted=rows.slice().sort(function(a,b){return b.implied_value_usd-a.implied_value_usd;});
+    var dist=node('section','insight distribution');
+    var dhead=node('div','insight-head');append(dhead,node('span','eyebrow','01 / FIELD SHAPE'),node('span','insight-meta',rows.length+' estimates'));
+    append(dist,dhead,node('h2','','The value curve'));
+    var values=rows.map(function(r){return Number(r.implied_value_usd);}).filter(function(v){return isFinite(v)&&v>0;}).sort(function(a,b){return a-b;});
+    var low=values[0]||1,high=values[values.length-1]||low,logLow=Math.log10(low),logSpan=Math.log10(high)-logLow,bucketCount=14,buckets=Array(bucketCount).fill(0);
+    values.forEach(function(v){var i=logSpan?Math.floor((Math.log10(v)-logLow)/logSpan*bucketCount):0;buckets[Math.max(0,Math.min(bucketCount-1,i))]++;});
+    var peak=Math.max.apply(null,buckets),median=values.length%2?values[(values.length-1)/2]:(values[values.length/2-1]+values[values.length/2])/2;
+    var chart=node('div','dist-chart'),axis=node('div','dist-y-axis'),plotWrap=node('div','dist-plot-wrap'),plot=node('div','dist-plot'),ticks=node('div','dist-x-axis');
+    [peak,Math.round(peak*.75),Math.round(peak*.5),Math.round(peak*.25),0].forEach(function(n,i){var label=node('span','',String(n));label.style.top=(i*25)+'%';axis.appendChild(label);});
+    buckets.forEach(function(count,i){var col=node('div','dist-column');col.style.height=(peak?count/peak*100:0)+'%';col.title='Bucket '+(i+1)+': '+count+' estimates';plot.appendChild(col);});
+    var medianPos=logSpan?(Math.log10(median)-logLow)/logSpan*100:50,medianLine=node('span','dist-median-line');medianLine.style.left=medianPos+'%';plot.appendChild(medianLine);
+    var medianLabel=node('span','dist-median-label','Median '+usd(median));medianLabel.style.left=Math.max(0,Math.min(100,medianPos))+'%';plot.appendChild(medianLabel);
+    var edges=[{value:low,label:usd(low)}];[{value:1e6,label:'$1M'},{value:1e7,label:'$10M'},{value:1e8,label:'$100M'},{value:1e9,label:'$1B'}].forEach(function(edge){if(edge.value>low&&edge.value<high)edges.push(edge);});if(high>low)edges.push({value:high,label:usd(high)});
+    edges.forEach(function(edge,i){var tick=node('span','',edge.label),position=logSpan?(Math.log10(edge.value)-logLow)/logSpan*100:0;tick.style.left=position+'%';if(i===0)tick.classList.add('edge-start');if(i===edges.length-1)tick.classList.add('edge-end');ticks.appendChild(tick);});
+    append(plotWrap,plot,ticks);append(chart,axis,plotWrap);dist.appendChild(chart);
+    var cats=Object.create(null);rows.forEach(function(r){var c=cats[r.category]||(cats[r.category]={sum:0,count:0,peer:Number(r.peer_median)});c.sum+=r.implied_value_usd;c.count++;});
+    var leaders=Object.keys(cats).map(function(k){return {name:k,sum:cats[k].sum,count:cats[k].count,peer:cats[k].peer};}).sort(function(a,b){return b.sum-a.sum;}).slice(0,5);
+    var category=node('section','insight category-insight');var chead=node('div','insight-head');append(chead,node('span','eyebrow','02 / CATEGORY WEIGHT'),node('span','insight-meta','Top five'));append(category,chead,node('h2','','Where value clusters'));
+    var catMax=leaders[0]?leaders[0].sum:1;leaders.forEach(function(c){var item=node('div','category-row');var top=node('div','category-top');append(top,node('strong','',c.name),node('span','category-value',usd(c.sum)));var track=node('div','category-track');var fill=node('i');fill.style.width=(c.sum/catMax*100)+'%';track.appendChild(fill);var meta=node('div','category-meta');append(meta,node('span','',c.count+' protocols'),node('span','', 'Peer median '+c.peer.toFixed(2)+'×'));append(item,top,track,meta);category.appendChild(item);});
+    var changes=rows.map(function(r){return r.change_7d;}).filter(function(x){return x!==null&&x!==undefined&&isFinite(x);}).sort(function(a,b){return a-b;});var rise=rows.filter(function(r){return r.change_7d!==null&&r.change_7d!==undefined;}).sort(function(a,b){return b.change_7d-a.change_7d;});
+    var grow=node('section','insight growth-insight');var ghead=node('div','insight-head');append(ghead,node('span','eyebrow','03 / SEVEN-DAY MOMENTUM'),node('span','insight-meta','Snapshot change'));append(grow,ghead,node('h2','','Growth, at a glance'));
+    var up=rows.filter(function(r){return r.change_7d>0;}).length,down=rows.filter(function(r){return r.change_7d<0;}).length,median=changes.length%2?changes[(changes.length-1)/2]:(changes[changes.length/2-1]+changes[changes.length/2])/2;
+    var balance=node('div','growth-balance'),upNum=node('div','growth-number positive'),downNum=node('div','growth-number negative');append(upNum,node('strong','',String(up)),node('small','',' rising'));append(downNum,node('strong','',String(down)),node('small','',' falling'));append(balance,upNum,node('span','versus','/'),downNum);
+    var growthTrack=node('div','growth-track');var upFill=node('i');upFill.style.width=(up/(up+down||1)*100)+'%';growthTrack.appendChild(upFill);var medianLine=node('p','median-change');append(medianLine,node('span','','Median '+percent(median)+' · '+(rows.length-up-down)+' flat / n.a.'),node('strong','','7 days'));append(grow,balance,growthTrack,medianLine);
+    var risers=node('div','risers');rise.slice(0,3).forEach(function(r,i){var item=node('div','riser');append(item,node('span','riser-rank','0'+(i+1)),link(r.name,'#/p/'+encodeURIComponent(r.slug),'riser-link'),node('strong','positive',percent(r.change_7d)));risers.appendChild(item);});grow.appendChild(risers);
+    append(band,dist,category,grow);return band;
+  }
   function drawBoard() {
     var wrap = shell('board');
     var hero = node('section', 'hero');
     var copy = node('div', 'hero-copy');
-    append(copy, node('div', 'kicker', 'Protocol intelligence / ' + D.model_version), node('h1', '', 'A radar for tokenless protocols.'), node('p', '', 'A ranked view of tokenless protocols using TVL, category peers, recent growth and operating age. Implied values are estimates; protocols with a trading token stay in their own market-data lane.'));
-    var note = node('aside', 'hero-note'); append(note, node('strong', '', 'One board, two realities'), node('span', '', 'Modelled potential below. Live token market caps on a separate route.'));
+    append(copy, node('div', 'kicker', 'Protocol intelligence / ' + D.model_version), node('h1', '', 'A radar for tokenless protocols.'), node('p', '', 'Tokenless valuations from TVL, peer, growth and age. Trading tokens stay separate.'));
+    var note = node('aside', 'hero-note');
+    var radarMark = node('div','radar-mark'); radarMark.setAttribute('aria-hidden','true');
+    append(note,radarMark,node('div','hero-note-copy'),node('div','hero-mini-stats'));
+    append(note.querySelector('.hero-note-copy'),node('strong','','One board, two realities'),node('span','','Modelled potential below. Live token market caps stay in their own lane.'));
+    append(note.querySelector('.hero-mini-stats'),node('b','',D.board_size + ' scored'),node('b','',D.watchlist_size + ' watchlist floor'));
     append(hero, copy, note); wrap.appendChild(hero);
     var stats = node('section', 'stats');
-    append(stats, stat('Protocols in snapshot', String(D.counts.protocols), 'protocol index'), stat('Watchlist covered', D.watchlist_size + ' / ' + D.watchlist_size, 'all qualifying protocols'), stat('Rows scored', String(D.board_size), 'pre-token ranking'), stat('Token protocols set aside', String(D.live_size), 'market values, not estimates'));
+    append(stats, stat('Indexed', String(D.counts.protocols), 'protocols'), stat('Watchlist', D.watchlist_size + ' / ' + D.watchlist_size, 'all represented'), stat('Pre-token', String(D.board_size), 'ranked estimates'), stat('Trading', String(D.live_size), 'market data, separate'));
     wrap.appendChild(stats);
+    wrap.appendChild(drawInsights());
     var box = node('section', 'filter-box'); var form = node('div', 'filters');
     function field(label, kind, options, value, cls, id) {
       var f = node('div', 'field' + (cls ? ' ' + cls : '')); var l = node('label', '', label); l.htmlFor = id;
@@ -146,12 +183,15 @@
     var minimum = field('Min implied value', 'select', [{value:'all',label:'Any value'},{value:'1000000',label:'$1M+'},{value:'10000000',label:'$10M+'},{value:'50000000',label:'$50M+'},{value:'100000000',label:'$100M+'},{value:'250000000',label:'$250M+'}], state.minimum, '', 'min-value');
     var sortSelect = field('Sort by', 'select', [{value:'rank',label:'Board rank'},{value:'name',label:'Protocol name'},{value:'tvl',label:'TVL'},{value:'change',label:'7-day change'},{value:'age',label:'Age'},{value:'multiple',label:'Multiple'},{value:'implied',label:'Implied value'}], state.sort, '', 'sort-order');
     [search,category,chain,band,minimum,sortSelect].forEach(function (f) { form.appendChild(f.box); });
+    var watch = node('label','watch-toggle'); var watchInput = node('input'); watchInput.type='checkbox'; watchInput.checked=state.watchlistOnly; watchInput.id='watchlist-only';
+    append(watch,watchInput,node('span','','Watchlist only')); form.appendChild(watch);
     box.appendChild(form);
     var results = node('div', 'results-line'); var count = node('span', 'count', ''); count.id = 'result-count'; results.appendChild(count);
-    var clear = node('button', 'clear', 'Reset filters'); clear.type = 'button'; clear.addEventListener('click', function () { state.q=''; state.category='all'; state.chain='all'; state.band='all'; state.minimum='all'; drawBoard(); });
+    var clear = node('button', 'clear', 'Reset filters'); clear.type = 'button'; clear.addEventListener('click', function () { state.q=''; state.category='all'; state.chain='all'; state.band='all'; state.minimum='all'; state.watchlistOnly=false; drawBoard(); });
     results.appendChild(clear); box.appendChild(results); wrap.appendChild(box);
     var boardSummary = node('section', 'board-summary'); boardSummary.id = 'board-summary'; wrap.appendChild(boardSummary);
     var panel = node('section', 'panel'); panel.id = 'board-table'; wrap.appendChild(panel);
+    watchInput.addEventListener('change',function(){state.watchlistOnly=watchInput.checked;updateTable();});
     [search.input,category.input,chain.input,band.input,minimum.input,sortSelect.input].forEach(function (input, i) {
       input.addEventListener(i === 0 ? 'input' : 'change', function () {
         if (i === 0) state.q = input.value;
@@ -173,27 +213,28 @@
     var summary = document.getElementById('board-summary');
     if (summary) {
       var total = list.reduce(function (sum, r) { return sum + r.implied_value_usd; }, 0);
-      var watchlistOnBoard = Math.max(0, D.board_size - D.early_size);
+      var onList = list.filter(function(r){return WATCHLIST.has(r.slug);}).length;
       summary.textContent = '';
-      append(summary, node('div','board-total',list.length + ' rows shown'), node('div','board-total',usd(total) + ' combined implied value'), node('div','board-total',watchlistOnBoard + ' watchlist entries covered'));
+      append(summary, node('div','board-total',list.length + ' rows shown'), node('div','board-total',usd(total) + ' combined implied value'), node('div','board-total',onList + ' watchlist entries in view'));
     }
     panel.textContent = '';
     if (!list.length) { panel.appendChild(node('p','empty','No protocols match these filters. Reset filters to restore the board.')); return; }
-    var sortedMultiples = rows.map(function (r) { return Number(r.peer_median); }).sort(function (a,b) { return a-b; });
-    var mid = Math.floor(sortedMultiples.length / 2);
-    var boardMedian = sortedMultiples.length % 2 ? sortedMultiples[mid] : (sortedMultiples[mid-1] + sortedMultiples[mid]) / 2;
+    var categoryMedians = Object.create(null);
+    D.peer_table.forEach(function(p){categoryMedians[p.category]=Number(p.median_multiple);});
     var max = rows.reduce(function (m,r) { return Math.max(m,r.implied_value_usd || 0); }, 1);
     var scroll = node('div','table-scroll'); var table = node('table');
-    table.appendChild(node('caption','', 'Pre-token protocols. Select a name for its value arithmetic and farm plan.'));
+    table.appendChild(node('caption','', 'Pre-token estimates · mint edge marks the watchlist coverage floor.'));
     var thead = node('thead'), hr = node('tr');
     [['rank','Rank'],['name','Protocol'],['tvl','TVL'],['change','7-day'],['age','Age'],['multiple','Multiple'],['implied','Implied value']].forEach(function (x) { hr.appendChild(sortButton(x[0],x[1])); });
     hr.appendChild(node('th','','Token')); thead.appendChild(hr); table.appendChild(thead);
     var tbody = node('tbody');
-    var ledger = node('tr','ledger'); var ledgerCell = node('td','',list.length + ' ranked rows · ' + usd(list.reduce(function (sum,r) { return sum + r.implied_value_usd; },0)) + ' combined · ' + Math.max(0,D.board_size-D.early_size) + ' watchlist entries covered · value bars compare with rank 1'); ledgerCell.colSpan = 8; ledger.appendChild(ledgerCell); tbody.appendChild(ledger);
+    var ledger = node('tr','ledger'); var ledgerCell = node('td','',list.length + ' ranked rows · ' + usd(list.reduce(function (sum,r) { return sum + r.implied_value_usd; },0)) + ' combined · mint rule = watchlist floor · value bars compare with rank 1'); ledgerCell.colSpan = 8; ledger.appendChild(ledgerCell); tbody.appendChild(ledger);
+    var previousCategory='';
     list.forEach(function (r) {
       var tr = boardRows[r.slug];
       if (!tr) {
         tr = node('tr'); tr.tabIndex = 0; tr.setAttribute('aria-label', r.name + ', detail');
+        if(WATCHLIST.has(r.slug)) tr.classList.add('watch-row');
         tr.addEventListener('click', function (e) { if (!e.target.closest('a')) window.location.hash = '/p/' + encodeURIComponent(r.slug); });
         tr.addEventListener('keydown', function (e) { if (e.key === 'Enter') window.location.hash = '/p/' + encodeURIComponent(r.slug); });
         tr.appendChild(boardCell('Rank', String(r.rank), 'rank num'));
@@ -207,11 +248,14 @@
         var val = node('td','value-cell'); val.setAttribute('data-label','Implied value');
         var line = node('div','value-line'); var bar = node('span','value-bar'); var fill = node('i'); fill.style.width = Math.max(1,Math.min(100,(r.implied_value_usd/max)*100)) + '%'; bar.appendChild(fill);
         append(line,bar,node('strong','num',usd(r.implied_value_usd)));
-        if (Number(r.peer_median).toFixed(2) !== boardMedian.toFixed(2)) line.appendChild(node('span','peer-multiple',Number(r.peer_median).toFixed(2) + '× peer'));
+        var categoryMedian=categoryMedians[r.category] || Number(r.peer_median);
+        if(Math.abs(Number(r.multiple)-categoryMedian)>0.005) line.appendChild(node('span','peer-multiple',((Number(r.multiple)/categoryMedian-1)*100).toFixed(0)+'% vs peer'));
         val.appendChild(line); tr.appendChild(val);
         var token = boardCell('Token','',''); token.appendChild(node('span','status','no token recorded')); tr.appendChild(token);
         boardRows[r.slug] = tr;
       }
+      if(previousCategory && previousCategory!==r.category) tr.classList.add('group-start');
+      previousCategory=r.category;
       tbody.appendChild(tr);
     });
     table.appendChild(tbody); scroll.appendChild(table); panel.appendChild(scroll);
@@ -240,28 +284,41 @@
     ];
     factorRows.forEach(function (x) { var row = node('div','formula-row'); append(row,node('span','formula-label',x[0]),node('strong','formula-val',x[1])); formula.appendChild(row); });
     model.appendChild(formula);
-    model.appendChild(node('p','equation-note','Implied value = TVL × category peer median × 7-day adjustment × age adjustment. Factors shown are the model inputs from this snapshot; the resulting combined multiple is applied to TVL. This is not a market price.'));
+    model.appendChild(node('p','equation-note','Implied value = TVL × peer median × growth adjustment × age adjustment. Snapshot inputs, not a market price.'));
+    var peerRecord=D.peer_table.find(function(p){return p.category===r.category;}),categoryMultiple=peerRecord&&peerRecord.category_observed_median!==null?Number(peerRecord.category_observed_median):Number(r.peer_median), marketValues=trading.map(function(t){return Number(t.mcap_over_tvl);}).filter(function(x){return isFinite(x);}).sort(function(a,b){return a-b;}), marketMultiple=marketValues.length%2?marketValues[(marketValues.length-1)/2]:(marketValues[marketValues.length/2-1]+marketValues[marketValues.length/2])/2;
+    var scenarios=[['Category observed',categoryMultiple],['All-market median',marketMultiple],['This protocol',Number(r.multiple)]];var scenarioMax=Math.max.apply(null,scenarios.map(function(x){return x[1];}).concat([0.001]));var scenario=node('div','scenario-chart');var scenarioHead=node('div','scenario-head');append(scenarioHead,node('h3','','Peer lens'),node('span','','TVL held constant · '+(peerRecord?peerRecord.sample_count:0)+' category peers'));scenario.appendChild(scenarioHead);
+    scenarios.forEach(function(x){var line=node('div','scenario-row'),name=node('span','scenario-name',x[0]),track=node('span','scenario-track'),fill=node('i');fill.style.width=Math.max(3,x[1]/scenarioMax*100)+'%';track.appendChild(fill);append(line,name,track,node('strong','scenario-value',usd(r.tvl_usd*x[1])),node('span','scenario-multiple',x[1].toFixed(2)+'×'));scenario.appendChild(line);});
+    var scenarioNote=node('p','scenario-note','Sparse groups use market fallback; growth and age shift the estimate.');scenario.appendChild(scenarioNote);model.appendChild(scenario);
     grid.appendChild(model);
     var figures = node('section','card'); figures.appendChild(node('h2','','Protocol figures'));
     var figureGrid = node('div','figure-grid');
-    [['TVL',usd(r.tvl_usd)],['7-day change',percent(r.change_7d)],['Operating age',age(r.age_days)],['Listed',r.listed_at || 'Date not recorded']].forEach(function (x) { var box = node('div','figure-box'); append(box,node('span','',x[0]),node('b','figure',x[1])); figureGrid.appendChild(box); });
+    var watchlistValue=rows.reduce(function(sum,row){return sum+(WATCHLIST.has(row.slug)?Number(row.implied_value_usd):0);},0),watchShare=watchlistValue?Number(r.implied_value_usd)/watchlistValue*100:0;
+    var peerRecord=D.peer_table.find(function(p){return p.category===r.category;}),categoryMultiple=peerRecord&&peerRecord.category_observed_median!==null?Number(peerRecord.category_observed_median):Number(peerRecord?peerRecord.median_multiple:r.peer_median);
+    [['TVL',usd(r.tvl_usd)],['7-day change',percent(r.change_7d)],['Operating age',age(r.age_days)],['Listed',r.listed_at || 'Date not recorded'],['Watchlist share of combined implied value',watchShare.toFixed(1)+'%'],['Category peer median · growth/age at 1×',usd(r.tvl_usd*categoryMultiple)]].forEach(function (x) { var box = node('div','figure-box'); append(box,node('span','',x[0]),node('b','figure',x[1])); figureGrid.appendChild(box); });
     figures.appendChild(figureGrid);
-    figures.appendChild(node('p','token-no','Token record: ' + (r.token_status === 'pre-token' ? 'No token recorded in this snapshot.' : 'A token record is present.')));
+    var figureNote=node('p','figure-note');append(figureNote,node('span','','Snapshot as of '+D.as_of),node('span','',D.board_size+' scored rows'));figures.appendChild(figureNote);
     grid.appendChild(figures); wrap.appendChild(grid);
-    var stepsSection = node('section','section'); var sh = node('div','section-head'); append(sh,node('h2','','A practical farm plan'),node('p','','Snapshot-generated steps · review risk before acting')); stepsSection.appendChild(sh);
+    var stepsSection = node('section','section'); var sh = node('div','section-head'); append(sh,node('h2','','A practical farm plan'),node('p','','Snapshot plan · review risks')); stepsSection.appendChild(sh);
     var ol = node('ol','steps');
+    var costTotal=0,timeMinutes=0,hasCost=false,stepNumber=0;
     (r.farm_steps || []).forEach(function (text) {
-      var li = node('li','step'); var content = node('div');
+      var li = node('li','step'); stepNumber++;
+      var number=node('span','step-number',String(stepNumber).padStart(2,'0'));var content = node('div','step-main');
+      li.appendChild(number);
       var cost = text.match(/Cost:\s*(.*?)(?:\s*Time:\s*(.*))?$/i);
       var body = cost ? text.slice(0,cost.index).trim() : text;
-      content.appendChild(node('p','step-text',body));
-      if (cost) { var chips = node('div','chips'); if (cost[1]) chips.appendChild(node('span','chip','Cost · ' + cost[1].replace(/[.;]$/,''))); if (cost[2]) chips.appendChild(node('span','chip','Time · ' + cost[2].replace(/[.;]$/,''))); content.appendChild(chips); }
-      li.appendChild(content); ol.appendChild(li);
+      content.appendChild(node('p','step-text',body));li.appendChild(content);
+      var costText=cost&&cost[1]?cost[1].replace(/[.;]$/,''):'Not stated';var timeText=cost&&cost[2]?cost[2].replace(/[.;]$/,''):'Not stated';
+      var amountMatches=costText.match(/\$\s*([\d,]+(?:\.\d+)?)/g)||[];amountMatches.forEach(function(x){var n=Number(x.replace(/[^\d.]/g,''));if(isFinite(n)){costTotal+=n;hasCost=true;}});
+      var duration=timeText.match(/(\d+(?:\.\d+)?)(?:\s*[–-]\s*(\d+(?:\.\d+)?))?\s*(minutes?|mins?|hours?|days?)/i);if(duration){var amount=(Number(duration[1])+(duration[2]?Number(duration[2]):0))/ (duration[2]?2:1);var unit=duration[3].toLowerCase();timeMinutes+=amount*(unit.indexOf('day')===0?1440:unit.indexOf('hour')===0?60:1);}
+      var costCol=node('div','step-metric step-cost');append(costCol,node('span','','COST'),node('strong','',costText));var timeCol=node('div','step-metric step-time');append(timeCol,node('span','','TIME'),node('strong','',timeText));append(li,costCol,timeCol);ol.appendChild(li);
     });
-    stepsSection.appendChild(ol); wrap.appendChild(stepsSection);
+    var totalDays=timeMinutes/1440,totalText=totalDays>=1?String(Math.round(totalDays*10)/10)+' days':Math.max(1,Math.round(timeMinutes/60))+' hours';
+    var planTotal=node('p','plan-total');append(planTotal,node('span','','Cost-chip total · capital at risk included'),node('strong','', 'About '+(hasCost?usd(costTotal):'cost not stated')+' and '+totalText));
+    stepsSection.appendChild(ol);stepsSection.appendChild(planTotal);wrap.appendChild(stepsSection);
     var peerTrading = trading.filter(function (t) { return t.category === r.category; }).slice(0,5);
     var market = node('section','section card'); var mh = node('div','section-head'); append(mh,node('h2','','Token-recording peers'),node('p','','Same category · market-reported data')); market.appendChild(mh);
-    market.appendChild(node('p','market-note','These are the market’s own values for protocols with a trading token — market cap and market-cap/TVL ratio, not radar estimates.'));
+    market.appendChild(node('p','market-note','Live-token peer values: market cap and mcap/TVL, not radar estimates.'));
     if (!peerTrading.length) market.appendChild(node('p','market-empty','No token-recording protocols from this category appear in the trading sample.'));
     else {
       var list = node('div','market-list'); peerTrading.forEach(function (t) {
@@ -341,6 +398,7 @@
   if (query.get('chain')) state.chain = query.get('chain');
   if (query.get('band')) state.band = query.get('band');
   if (query.get('minimum')) state.minimum = query.get('minimum');
+  if (query.get('watchlist') === '1') state.watchlistOnly = true;
   window.addEventListener('hashchange', render);
   render();
 })();
